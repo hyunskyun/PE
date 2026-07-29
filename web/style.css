@@ -1,0 +1,87 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --bg: #fafafa;
+  --accent: #2563eb;
+  --danger: #dc2626;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #eaeaea; --bg: #121212; }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Pretendard", "Malgun Gothic", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1 { font-size: 1.4rem; margin-bottom: 4px; }
+.desc { opacity: 0.7; font-size: 0.9rem; margin-top: 0; }
+
+.inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.inputs label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.inputs input {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #8884;
+  width: 160px;
+}
+
+button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.stage {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+}
+video, canvas {
+  width: 100%;
+  border-radius: 8px;
+  display: block;
+}
+canvas { position: absolute; top: 0; left: 0; }
+
+.panel {
+  margin-top: 20px;
+  padding: 14px;
+  border-radius: 8px;
+  background: #8881;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.metric-line.error { color: var(--danger); font-weight: 600; }

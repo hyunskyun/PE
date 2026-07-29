@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>50m 달리기 자세 분석</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<main>
+  <h1>50m 달리기 자세 분석</h1>
+  <p class="desc">측면에서 촬영한 달리기 영상을 올리면 브라우저에서 바로 분석합니다. 서버로 영상이 전송되지 않습니다.</p>
+
+  <div class="inputs">
+    <label>영상 파일 <input type="file" id="videoInput" accept="video/*" /></label>
+    <label>신장(cm) <input type="number" id="heightInput" placeholder="예: 170" /></label>
+    <label>가속 구간 종료 시점(초, 선택) <input type="number" id="splitInput" step="0.1" placeholder="비워두면 자동(35%)" /></label>
+    <button id="startBtn" disabled>분석 시작</button>
+  </div>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <section id="liveMetrics" class="panel"></section>
+  <section id="finalReport" class="panel"></section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

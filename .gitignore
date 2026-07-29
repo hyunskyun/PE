@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+posture_analysis/models/
+*.mp4
+*.mov
+report.json
