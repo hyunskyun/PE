@@ -1,0 +1,24 @@
+# 순수 로직 단위 테스트만 실행한다.
+# MediaPipe/OpenCV는 CI에서 설치하지 않는다 — 테스트 대상 모듈은
+# 해당 라이브러리 없이 임포트되도록 분리되어 있다 (pose_extractor 제외).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
