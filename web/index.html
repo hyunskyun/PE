@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>50m 달리기 자세 분석</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Malgun Gothic", sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  .panel { border: 1px solid #8884; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  label { display: inline-block; min-width: 8rem; }
+  input[type=number] { width: 6rem; }
+  #videoWrap { position: relative; width: 100%; max-width: 640px; }
+  video, canvas { width: 100%; display: block; }
+  canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+  progress { width: 100%; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { border: 1px solid #8884; padding: .3rem .5rem; text-align: left; font-size: .9rem; }
+  .ok { color: #2a8f2a; }
+  .bad { color: #c0392b; font-weight: bold; }
+  #status { font-size: .9rem; opacity: .8; }
+  button { padding: .5rem 1rem; font-size: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>50m 달리기 자세 분석 (브라우저 버전)</h1>
+<p>
+  이 페이지는 서버 없이 브라우저(클라이언트)에서만 동작합니다. 업로드한 영상은
+  외부로 전송되지 않고 이 컴퓨터/스마트폰 안에서만 처리됩니다. 로직은
+  <code>posture_analyzer</code> 파이썬 패키지와 동일한 기준을 사용합니다.
+</p>
+
+<div class="panel">
+  <div>
+    <label for="videoInput">측면 영상</label>
+    <input type="file" id="videoInput" accept="video/*" />
+  </div>
+  <div style="margin-top:.5rem">
+    <label for="heightInput">신장(cm)</label>
+    <input type="number" id="heightInput" placeholder="선택 입력" />
+  </div>
+  <div style="margin-top:.5rem">
+    <label for="intervalInput">분석 간격(초)</label>
+    <input type="number" id="intervalInput" value="0.1" step="0.05" min="0.03" />
+  </div>
+  <div style="margin-top:1rem">
+    <button id="analyzeBtn" disabled>분석 시작</button>
+  </div>
+  <p id="status">영상을 선택하면 모델을 불러옵니다 (최초 1회, 인터넷 필요).</p>
+  <progress id="progressBar" value="0" max="1" hidden></progress>
+</div>
+
+<div id="videoWrap" class="panel" hidden>
+  <video id="video" muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="resultPanel" class="panel" hidden>
+  <h2>분석 리포트</h2>
+  <div id="reportOutput"></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+/* =========================================================================
+ * 1. 설정값 (posture_analyzer/config.py 와 동일한 값)
+ * ========================================================================= */
+const PHASE_ACCEL = "acceleration";
+const PHASE_MAXV = "max_velocity";
+
+const PHASE_LABELS = { [PHASE_ACCEL]: "가속 구간", [PHASE_MAXV]: "최대 속도 구간" };
+
+const METRIC_LABELS = {
+  torso_lean_deg: "상체 전방 기울기",
+  knee_angle_deg: "무릎 각도",
+  arm_swing_angle_deg: "팔치기 각도",
+  stride_ratio: "보폭 비율(신장 대비)",
+  landing_hip_offset_ratio: "착지-엉덩이 수평거리 비율",
+};
+
+const THRESHOLDS = {
+  [PHASE_ACCEL]: {
+    torso_lean_deg: [15, 45],
+    knee_angle_deg: [100, 150],
+    arm_swing_angle_deg: [70, 120],
+    stride_ratio: [0.80, 1.15],
+    landing_hip_offset_ratio: [0, 0.15],
+  },
+  [PHASE_MAXV]: {
+    torso_lean_deg: [5, 12],
+    knee_angle_deg: [140, 175],
+    arm_swing_angle_deg: [80, 130],
+    stride_ratio: [0.85, 1.25],
+    landing_hip_offset_ratio: [0, 0.20],
+  },
+};
+
+// (지표, 구간, "low"/"high") -> [오류 라벨, 교정 문장]
+const ERROR_MESSAGES = {
+  "torso_lean_deg|acceleration|low": ["초기 전방 기울기 부족", "가속 구간에서 상체를 더 앞으로 기울여 추진력을 만드세요."],
+  "torso_lean_deg|acceleration|high": ["전방 기울기 과다", "상체가 지나치게 숙여져 있습니다. 허리를 곧게 펴보세요."],
+  "torso_lean_deg|max_velocity|low": ["직립 자세 과다", "최대 속도 구간에서 상체가 너무 세워져 있습니다."],
+  "torso_lean_deg|max_velocity|high": ["상체 기울기 과다", "상체를 너무 숙이면 보폭이 짧아집니다. 조금 더 세우세요."],
+  "knee_angle_deg|acceleration|low": ["무릎 굴곡 과다", "무릎이 과도하게 접혀 있습니다."],
+  "knee_angle_deg|acceleration|high": ["무릎 굴곡 부족", "가속 구간에서 무릎을 더 접어 강하게 밀어내세요."],
+  "knee_angle_deg|max_velocity|low": ["무릎 신전 부족", "최대 속도 구간에서 무릎을 충분히 펴지 못하고 있습니다."],
+  "knee_angle_deg|max_velocity|high": ["무릎 과신전", "무릎이 과도하게 펴져 있습니다."],
+  "arm_swing_angle_deg|acceleration|low": ["팔치기 각도 부족", "팔꿈치를 더 크게 굽혀 강하게 흔드세요."],
+  "arm_swing_angle_deg|acceleration|high": ["팔치기 각도 과다", "팔꿈치를 90도 안팎으로 유지하세요."],
+  "arm_swing_angle_deg|max_velocity|low": ["팔 스윙 부족", "팔치기 폭을 늘려보세요."],
+  "arm_swing_angle_deg|max_velocity|high": ["팔 스윙 과다", "팔이 과도하게 펴져 리듬이 흐트러질 수 있습니다."],
+  "stride_ratio|acceleration|low": ["보폭 부족", "가속 구간에서 보폭이 짧습니다."],
+  "stride_ratio|acceleration|high": ["오버스트라이딩 의심", "보폭이 과도하게 큽니다."],
+  "stride_ratio|max_velocity|low": ["보폭 부족", "최대 속도 구간에서 다리를 더 크게 뻗어보세요."],
+  "stride_ratio|max_velocity|high": ["오버스트라이딩 의심", "회전 수(피치)를 늘리는 방향으로 조정하세요."],
+  "landing_hip_offset_ratio|acceleration|high": ["발 착지 위치 과다 전방", "착지 발이 엉덩이보다 너무 앞에 있습니다."],
+  "landing_hip_offset_ratio|max_velocity|high": ["발 착지 위치 과다 전방", "엉덩이 아래로 착지하도록 연습하세요."],
+};
+
+/* =========================================================================
+ * 2. 좌표 계산 (posture_analyzer/geometry.py 포팅)
+ * ========================================================================= */
+function angleAtVertex(a, b, c) {
+  const bax = a.x - b.x, bay = a.y - b.y;
+  const bcx = c.x - b.x, bcy = c.y - b.y;
+  const magBa = Math.hypot(bax, bay), magBc = Math.hypot(bcx, bcy);
+  if (magBa < 1e-6 || magBc < 1e-6) return null;
+  let cosVal = (bax * bcx + bay * bcy) / (magBa * magBc);
+  cosVal = Math.max(-1, Math.min(1, cosVal));
+  return (Math.acos(cosVal) * 180) / Math.PI;
+}
+
+function leanAngleFromVertical(top, bottom) {
+  const dx = top.x - bottom.x;
+  const dy = bottom.y - top.y;
+  if (dx === 0 && dy === 0) return 0;
+  return (Math.atan2(Math.abs(dx), Math.max(dy, 1e-6)) * 180) / Math.PI;
+}
+
+function distance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function midpoint(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+
+/* =========================================================================
+ * 3. 프레임 지표 계산 (posture_analyzer/metrics.py 포팅)
+ * ========================================================================= */
+const IDX = { nose: 0, shoulderL: 11, shoulderR: 12, elbowL: 13, elbowR: 14,
+  wristL: 15, wristR: 16, hipL: 23, hipR: 24, kneeL: 25, kneeR: 26, ankleL: 27, ankleR: 28 };
+
+function toPixel(lm, w, h) { return { x: lm.x * w, y: lm.y * h, visibility: lm.visibility ?? 1 }; }
+
+function pickVisibleSide(pts) {
+  const leftScore = (pts.shoulderL.visibility + pts.elbowL.visibility + pts.wristL.visibility +
+    pts.hipL.visibility + pts.kneeL.visibility + pts.ankleL.visibility) / 6;
+  const rightScore = (pts.shoulderR.visibility + pts.elbowR.visibility + pts.wristR.visibility +
+    pts.hipR.visibility + pts.kneeR.visibility + pts.ankleR.visibility) / 6;
+  return leftScore >= rightScore ? "L" : "R";
+}
+
+function computeFrameMetrics(landmarks, frameIdx, timeSec, width, height) {
+  const pts = {
+    nose: toPixel(landmarks[IDX.nose], width, height),
+    shoulderL: toPixel(landmarks[IDX.shoulderL], width, height), shoulderR: toPixel(landmarks[IDX.shoulderR], width, height),
+    elbowL: toPixel(landmarks[IDX.elbowL], width, height), elbowR: toPixel(landmarks[IDX.elbowR], width, height),
+    wristL: toPixel(landmarks[IDX.wristL], width, height), wristR: toPixel(landmarks[IDX.wristR], width, height),
+    hipL: toPixel(landmarks[IDX.hipL], width, height), hipR: toPixel(landmarks[IDX.hipR], width, height),
+    kneeL: toPixel(landmarks[IDX.kneeL], width, height), kneeR: toPixel(landmarks[IDX.kneeR], width, height),
+    ankleL: toPixel(landmarks[IDX.ankleL], width, height), ankleR: toPixel(landmarks[IDX.ankleR], width, height),
+  };
+  const side = pickVisibleSide(pts);
+  const s = (name) => pts[name + side];
+
+  const shoulderCenter = midpoint(pts.shoulderL, pts.shoulderR);
+  const hipCenter = midpoint(pts.hipL, pts.hipR);
+  const ankleMid = midpoint(pts.ankleL, pts.ankleR);
+  const bodyHeightPx = distance(pts.nose, ankleMid);
+
+  return {
+    frameIdx, timeSec, side,
+    torsoLeanDeg: leanAngleFromVertical(shoulderCenter, hipCenter),
+    kneeAngleDeg: angleAtVertex(s("hip"), s("knee"), s("ankle")),
+    armSwingAngleDeg: angleAtVertex(s("shoulder"), s("elbow"), s("wrist")),
+    hipX: hipCenter.x,
+    ankleLX: pts.ankleL.x, ankleLY: pts.ankleL.y,
+    ankleRX: pts.ankleR.x, ankleRY: pts.ankleR.y,
+    bodyHeightPx: bodyHeightPx > 1e-3 ? bodyHeightPx : null,
+  };
+}
+
+/* =========================================================================
+ * 4. 구간 분류 (posture_analyzer/phases.py 포팅)
+ * ========================================================================= */
+function movingAverage(values, window) {
+  const half = Math.floor(window / 2);
+  return values.map((_, i) => {
+    const chunk = values.slice(Math.max(0, i - half), Math.min(values.length, i + half + 1)).filter((v) => v !== null);
+    return chunk.length ? chunk.reduce((a, b) => a + b, 0) / chunk.length : null;
+  });
+}
+
+function segmentPhases(frames, fps, smoothingWindow = 5, sustainSec = 0.3, plateauRatio = 0.85) {
+  if (frames.length < 2) return frames.map(() => PHASE_ACCEL);
+  const hipX = frames.map((f) => f.hipX);
+  const rawSpeed = [null, ...hipX.slice(1).map((v, i) => Math.abs(v - hipX[i]))];
+  const speed = movingAverage(rawSpeed, smoothingWindow);
+  const validSpeeds = speed.filter((v) => v !== null);
+
+  let boundary = null;
+  if (validSpeeds.length) {
+    const threshold = Math.max(...validSpeeds) * plateauRatio;
+    const sustainFrames = Math.max(1, Math.round(sustainSec * fps));
+    let streak = 0;
+    for (let i = 0; i < speed.length; i++) {
+      if (speed[i] !== null && speed[i] >= threshold) {
+        streak++;
+        if (streak >= sustainFrames) { boundary = i - sustainFrames + 1; break; }
+      } else { streak = 0; }
+    }
+  }
+  if (boundary === null) boundary = Math.floor(frames.length * 0.4);
+  return frames.map((_, i) => (i < boundary ? PHASE_ACCEL : PHASE_MAXV));
+}
+
+/* =========================================================================
+ * 5. 착지 감지 (posture_analyzer/landing.py 포팅)
+ * ========================================================================= */
+function findLocalMaxima(values, minGap) {
+  const peaks = [];
+  for (let i = 1; i < values.length - 1; i++) {
+    if (values[i] > values[i - 1] && values[i] >= values[i + 1]) {
+      if (peaks.length && i - peaks[peaks.length - 1] < minGap) {
+        if (values[i] > values[peaks[peaks.length - 1]]) peaks[peaks.length - 1] = i;
+      } else {
+        peaks.push(i);
+      }
+    }
+  }
+  return peaks;
+}
+
+function detectLandingEvents(frames, fps, minIntervalSec = 0.15) {
+  const minGap = Math.max(1, Math.round(minIntervalSec * fps));
+  const leftPeaks = findLocalMaxima(frames.map((f) => f.ankleLY), minGap).map((i) => [i, "L"]);
+  const rightPeaks = findLocalMaxima(frames.map((f) => f.ankleRY), minGap).map((i) => [i, "R"]);
+  const candidates = [...leftPeaks, ...rightPeaks].sort((a, b) => a[0] - b[0]);
+
+  const events = [];
+  for (const [idx, foot] of candidates) {
+    const m = frames[idx];
+    if (!m.bodyHeightPx) continue;
+    const stridePx = Math.abs(m.ankleLX - m.ankleRX);
+    const landingAnkleX = foot === "L" ? m.ankleLX : m.ankleRX;
+    const offsetPx = Math.abs(landingAnkleX - m.hipX);
+    events.push({ frameIdx: idx, foot, strideRatio: stridePx / m.bodyHeightPx, landingHipOffsetRatio: offsetPx / m.bodyHeightPx });
+  }
+  return events;
+}
+
+/* =========================================================================
+ * 6. 조건문 판정 + 리포트 집계 (posture_analyzer/judge.py, report.py 포팅)
+ * ========================================================================= */
+function evaluateMetric(metric, value, phase) {
+  const [lo, hi] = THRESHOLDS[phase][metric];
+  if (value < lo) {
+    const [label, feedback] = ERROR_MESSAGES[`${metric}|${phase}|low`] ?? ["범위 미달", "권장 범위보다 낮습니다."];
+    return { metric, phase, value, isOk: false, label, feedback };
+  }
+  if (value > hi) {
+    const [label, feedback] = ERROR_MESSAGES[`${metric}|${phase}|high`] ?? ["범위 초과", "권장 범위보다 높습니다."];
+    return { metric, phase, value, isOk: false, label, feedback };
+  }
+  return { metric, phase, value, isOk: true, label: null, feedback: null };
+}
+
+function buildReport(frames, phases, landingEvents, userHeightCm) {
+  const byPhaseMetric = { [PHASE_ACCEL]: {}, [PHASE_MAXV]: {} };
+  const pushEval = (phase, metric, evalResult) => {
+    (byPhaseMetric[phase][metric] ??= []).push(evalResult);
+  };
+
+  frames.forEach((f, i) => {
+    const phase = phases[i];
+    if (f.torsoLeanDeg !== null) pushEval(phase, "torso_lean_deg", evaluateMetric("torso_lean_deg", f.torsoLeanDeg, phase));
+    if (f.kneeAngleDeg !== null) pushEval(phase, "knee_angle_deg", evaluateMetric("knee_angle_deg", f.kneeAngleDeg, phase));
+    if (f.armSwingAngleDeg !== null) pushEval(phase, "arm_swing_angle_deg", evaluateMetric("arm_swing_angle_deg", f.armSwingAngleDeg, phase));
+  });
+  for (const ev of landingEvents) {
+    const phase = phases[ev.frameIdx];
+    pushEval(phase, "stride_ratio", evaluateMetric("stride_ratio", ev.strideRatio, phase));
+    pushEval(phase, "landing_hip_offset_ratio", evaluateMetric("landing_hip_offset_ratio", ev.landingHipOffsetRatio, phase));
+  }
+
+  const errorCounts = new Map();
+  const errorFeedback = new Map();
+  const phaseReports = {};
+
+  for (const phase of [PHASE_ACCEL, PHASE_MAXV]) {
+    const metricReports = {};
+    let okTotal = 0, sampleTotal = 0;
+    for (const [metric, evals] of Object.entries(byPhaseMetric[phase])) {
+      if (!evals.length) continue;
+      const okCount = evals.filter((e) => e.isOk).length;
+      const avgValue = evals.reduce((a, e) => a + e.value, 0) / evals.length;
+
+      const labelCounts = new Map();
+      for (const e of evals) if (!e.isOk) labelCounts.set(e.label, (labelCounts.get(e.label) ?? 0) + 1);
+      const status = okCount === evals.length ? "적정" : [...labelCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+
+      metricReports[metric] = {
+        label: METRIC_LABELS[metric], average: Math.round(avgValue * 100) / 100,
+        range: THRESHOLDS[phase][metric], okCount, totalCount: evals.length, status,
+      };
+      if (metric === "stride_ratio" && userHeightCm) {
+        metricReports[metric].averageCm = Math.round(avgValue * userHeightCm * 10) / 10;
+      }
+
+      okTotal += okCount; sampleTotal += evals.length;
+      for (const e of evals) if (!e.isOk) {
+        errorCounts.set(e.label, (errorCounts.get(e.label) ?? 0) + 1);
+        errorFeedback.set(e.label, e.feedback);
+      }
+    }
+    phaseReports[phase] = {
+      label: PHASE_LABELS[phase], metrics: metricReports, sampleCount: sampleTotal,
+      score: sampleTotal ? Math.round((100 * okTotal) / sampleTotal * 10) / 10 : null,
+    };
+  }
+
+  const priorityIssues = [...errorCounts.entries()]
+    .sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([label, count]) => ({ label, count, feedback: errorFeedback.get(label) }));
+
+  return { frameCount: frames.length, phases: phaseReports, priorityIssues };
+}
+
+function renderReport(report) {
+  const el = document.getElementById("reportOutput");
+  let html = `<p>총 분석 프레임: ${report.frameCount}</p>`;
+
+  for (const phase of Object.values(report.phases)) {
+    const scoreText = phase.score !== null ? `${phase.score}점` : "N/A";
+    html += `<h3>${phase.label} (표본 수: ${phase.sampleCount}, 구간 점수: ${scoreText})</h3>`;
+    const rows = Object.values(phase.metrics);
+    if (!rows.length) {
+      html += `<p>이 구간에서 분석된 데이터가 없습니다.</p>`;
+    } else {
+      html += `<table><tr><th>지표</th><th>평균</th><th>권장 범위</th><th>판정</th></tr>`;
+      for (const m of rows) {
+        const cm = m.averageCm !== undefined ? ` (약 ${m.averageCm}cm)` : "";
+        const cls = m.status === "적정" ? "ok" : "bad";
+        html += `<tr><td>${m.label}</td><td>${m.average}${cm}</td><td>${m.range[0]}~${m.range[1]}</td><td class="${cls}">${m.status}</td></tr>`;
+      }
+      html += `</table>`;
+    }
+  }
+
+  if (report.priorityIssues.length) {
+    html += `<h3>우선 교정 필요 항목</h3><ol>`;
+    for (const issue of report.priorityIssues) {
+      html += `<li><b>${issue.label}</b> (${issue.count}회 발생) - ${issue.feedback}</li>`;
+    }
+    html += `</ol>`;
+  } else {
+    html += `<p>특별한 오류가 발견되지 않았습니다.</p>`;
+  }
+  el.innerHTML = html;
+  document.getElementById("resultPanel").hidden = false;
+}
+
+/* =========================================================================
+ * 7. 영상 처리 파이프라인 (posture_analyzer/pipeline.py 포팅)
+ * ========================================================================= */
+const videoInput = document.getElementById("videoInput");
+const heightInput = document.getElementById("heightInput");
+const intervalInput = document.getElementById("intervalInput");
+const analyzeBtn = document.getElementById("analyzeBtn");
+const statusEl = document.getElementById("status");
+const progressBar = document.getElementById("progressBar");
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const videoWrap = document.getElementById("videoWrap");
+
+let poseLandmarker = null;
+
+async function loadModel() {
+  statusEl.textContent = "모델을 불러오는 중입니다...";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+  statusEl.textContent = "모델 준비 완료. 영상을 업로드하고 분석을 시작하세요.";
+  analyzeBtn.disabled = false;
+}
+
+videoInput.addEventListener("change", () => {
+  const file = videoInput.files[0];
+  if (!file) return;
+  video.src = URL.createObjectURL(file);
+  videoWrap.hidden = false;
+  if (!poseLandmarker) loadModel();
+});
+
+function drawSkeleton(landmarks, w, h) {
+  const ctx = overlay.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#00e0ff";
+  for (const lm of landmarks) {
+    ctx.beginPath();
+    ctx.arc(lm.x * w, lm.y * h, 3, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+async function seekTo(timeSec) {
+  return new Promise((resolve) => {
+    video.currentTime = timeSec;
+    video.onseeked = () => resolve();
+  });
+}
+
+async function analyzeCurrentVideo() {
+  const interval = parseFloat(intervalInput.value) || 0.1;
+  const userHeightCm = parseFloat(heightInput.value) || null;
+  const duration = video.duration;
+  const fps = 1 / interval; // 표본 추출 간격 기준 유효 fps
+
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+  progressBar.hidden = false;
+
+  const frames = [];
+  let fakeTimestampMs = 0;
+
+  for (let t = 0; t < duration; t += interval) {
+    await seekTo(t);
+    fakeTimestampMs += Math.round(interval * 1000);
+    const result = poseLandmarker.detectForVideo(video, fakeTimestampMs);
+    if (result.landmarks && result.landmarks.length) {
+      const landmarks = result.landmarks[0];
+      drawSkeleton(landmarks, overlay.width, overlay.height);
+      frames.push(computeFrameMetrics(landmarks, frames.length, t, video.videoWidth, video.videoHeight));
+    }
+    progressBar.value = t / duration;
+    statusEl.textContent = `분석 중... ${Math.round((t / duration) * 100)}%`;
+  }
+
+  progressBar.hidden = true;
+
+  if (frames.length < 2) {
+    statusEl.textContent = "사람을 충분히 인식하지 못했습니다. 촬영 각도/조명을 확인해주세요.";
+    return;
+  }
+
+  const phases = segmentPhases(frames, fps);
+  const landingEvents = detectLandingEvents(frames, fps);
+  const report = buildReport(frames, phases, landingEvents, userHeightCm);
+
+  statusEl.textContent = "분석 완료";
+  renderReport(report);
+}
+
+analyzeBtn.addEventListener("click", () => {
+  analyzeBtn.disabled = true;
+  analyzeCurrentVideo().finally(() => { analyzeBtn.disabled = false; });
+});
+</script>
+</body>
+</html>
